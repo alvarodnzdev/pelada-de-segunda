@@ -1,0 +1,36 @@
+rules_version = '2';
+// Todo mundo lê o placar. Só escreve quem manda, no mesmo envio, a senha do marcador.
+// A senha fica em documentos que ninguém consegue ler.
+service cloud.firestore {
+  match /databases/{db}/documents {
+    // O envio precisa gravar a senha certa em /chaves/pelada junto com a alteração.
+    function chaveOk() {
+      let chave = getAfter(/databases/$(db)/documents/chaves/pelada).data;
+      return chave.at == request.time
+        && chave.senha == get(/databases/$(db)/documents/segredos/pelada).data.senha;
+    }
+    match /grupos/pelada {
+      allow read: if true;
+      allow create, update: if request.resource.data.keys().hasOnly(['data', 'at', 'by'])
+        && request.resource.data.data is string
+        && request.resource.data.data.size() < 900000
+        && chaveOk();
+    }
+    match /testes/pelada {
+      allow create, update: if chaveOk();
+    }
+    match /chaves/pelada {
+      allow create, update: if request.resource.data.keys().hasOnly(['senha', 'at'])
+        && request.resource.data.senha is string
+        && request.resource.data.senha.size() <= 64
+        && request.resource.data.at == request.time;
+    }
+    // A senha é definida uma única vez, por quem ativa o placar ao vivo.
+    match /segredos/pelada {
+      allow create: if request.resource.data.keys().hasOnly(['senha'])
+        && request.resource.data.senha is string
+        && request.resource.data.senha.size() >= 4
+        && request.resource.data.senha.size() <= 64;
+    }
+  }
+}

@@ -101,6 +101,9 @@ nav button span{display:block;font-size:20px}
 #toast{position:fixed;left:16px;right:16px;top:calc(12px + env(safe-area-inset-top));margin:0 auto;max-width:528px;
   background:var(--ink);color:var(--bg);border-radius:12px;padding:12px 14px;display:none;
   align-items:center;justify-content:space-between;gap:10px;z-index:6;font-weight:600}
+body.ro .ed{display:none!important}
+body.ro .chip,body.ro .pbtn{pointer-events:none}
+.live{background:var(--soft);border-radius:10px;padding:8px 12px;margin-bottom:12px;font-size:14px;font-weight:600}
 #toast button{background:none;border:0;color:inherit;text-decoration:underline;font-weight:700;min-height:32px}
 </style>
 </head>
@@ -129,8 +132,98 @@ function normalize(d){
   const rules=Object.assign({min:0,goals:0,assist:true},d.prefs&&d.prefs.rules);
   return{players:d.players||[],sessions:d.sessions||[],current:d.current||null,prefs:{rules}};
 }
-function load(){let d={};try{d=JSON.parse(localStorage.getItem(KEY))||{}}catch(e){}return normalize(d)}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}}
+const ls={get(k){try{return localStorage.getItem(k)}catch(e){return null}},
+  set(k,v){try{v==null?localStorage.removeItem(k):localStorage.setItem(k,v)}catch(e){}}};
+const parse=t=>{try{return normalize(JSON.parse(t))}catch(e){return normalize()}};
+
+/* ---------- placar ao vivo (Firebase) ----------
+   Quem tem a senha do marcador (cloud.key) grava; os outros só acompanham.
+   Fora do Firebase Hosting não há configuração, e o app funciona só neste aparelho. */
+const CONFIG_URL='/__/firebase/init.json'; // o Firebase Hosting entrega a configuração do projeto neste endereço
+const FB='https://www.gstatic.com/firebasejs/12.0.0/';
+const DEVICE=ls.get('pelada.device')||(()=>{const d=uid()+uid();ls.set('pelada.device',d);return d})();
+const cloud={on:false,exists:ls.get('pelada.cloud')==='1',key:ls.get('pelada.key'),last:null,timer:null,sent:null,fs:null,db:null};
+const isViewer=()=>cloud.exists&&!cloud.key;
+
+function load(){return parse(ls.get(isViewer()?'pelada.cache':KEY))}
+function save(){
+  if(isViewer())return;
+  const j=JSON.stringify(S);
+  if(j===cloud.sent)return;
+  cloud.sent=j;ls.set(KEY,j);
+  if(cloud.on&&cloud.key){clearTimeout(cloud.timer);cloud.timer=setTimeout(()=>{cloud.timer=null;send(cloud.key).catch(sendFailed)},700)}
+}
+function send(key){
+  const{fs,db}=cloud,b=fs.writeBatch(db);
+  b.set(fs.doc(db,'chaves','pelada'),{senha:key,at:fs.serverTimestamp()});
+  b.set(fs.doc(db,'grupos','pelada'),{data:JSON.stringify(S),at:fs.serverTimestamp(),by:DEVICE});
+  return b.commit();
+}
+function sendFailed(e){
+  if(!e||e.code!=='permission-denied'||!cloud.key)return;
+  if(!cloud.retried){cloud.retried=true;setTimeout(()=>{if(cloud.key)send(cloud.key).then(()=>{cloud.retried=false},sendFailed)},4000);return} // uma recusa isolada não derruba o marcador
+  cloud.retried=false;
+  cloud.key=null;ls.set('pelada.key',null);
+  if(cloud.last){S=parse(cloud.last);ui.sheet=null}
+  render();toast('A senha do marcador não vale mais neste celular');
+}
+function onRemote(snap){
+  cloud.exists=snap.exists();ls.set('pelada.cloud',cloud.exists?'1':null);
+  if(cloud.exists&&!snap.metadata.hasPendingWrites){
+    const d=snap.data();cloud.last=d.data;
+    if(!cloud.key){S=parse(d.data);ls.set('pelada.cache',d.data);ui.sheet=null}
+    else if(d.by!==DEVICE&&!cloud.timer){S=parse(d.data);cloud.sent=d.data;ls.set(KEY,d.data);ui.sheet=null} // outro marcador gravou
+  }
+  render();
+}
+// se a escuta cair (erro de permissão ou de rede), tenta de novo em alguns segundos
+function listen(){const{fs,db}=cloud;fs.onSnapshot(fs.doc(db,'grupos','pelada'),onRemote,()=>setTimeout(listen,5000))}
+async function cloudInit(){
+  try{
+    const res=await fetch(CONFIG_URL);
+    if(!res.ok)return;
+    const cfg=await res.json();
+    const[app,fs]=await Promise.all([import(FB+'firebase-app.js'),import(FB+'firebase-firestore.js')]);
+    const a=app.initializeApp(cfg);
+    let db;
+    try{db=fs.initializeFirestore(a,{localCache:fs.persistentLocalCache({tabManager:fs.persistentMultipleTabManager()})})}
+    catch(e){db=fs.getFirestore(a)}
+    cloud.fs=fs;cloud.db=db;cloud.on=true;
+    listen();
+    render();
+  }catch(e){}
+}
+const within=(p,ms)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej({code:'timeout'}),ms))]);
+async function becomeScorer(){
+  if(!cloud.on||!navigator.onLine){toast('Sem conexão. Tente de novo com internet.');return}
+  const first=!cloud.exists;
+  const key=(prompt(first?'Crie a senha do marcador (mínimo 4 caracteres). Só quem tiver a senha consegue marcar gols.':'Senha do marcador')||'').trim();
+  if(!key)return;
+  if(key.length<4||key.length>64){toast('A senha precisa ter de 4 a 64 caracteres');return}
+  const{fs,db}=cloud;
+  try{await within(fs.setDoc(fs.doc(db,'segredos','pelada'),{senha:key}),8000)}catch(e){} // só grava se ainda não existe senha
+  try{
+    const b=fs.writeBatch(db);
+    b.set(fs.doc(db,'chaves','pelada'),{senha:key,at:fs.serverTimestamp()});
+    b.set(fs.doc(db,'testes','pelada'),{at:fs.serverTimestamp()});
+    await within(b.commit(),8000);
+  }catch(e){toast(e&&e.code==='permission-denied'?'Senha incorreta':'Não deu para conferir a senha. Tente de novo.');return}
+  // decide entre os dados deste celular e os que já estão na nuvem
+  const own=parse(ls.get(KEY)),remote=cloud.last?parse(cloud.last):null;
+  const has=d=>!!d&&(d.sessions.length||d.players.length||d.current);
+  const useOwn=!has(remote)||(has(own)&&ls.get('pelada.synced')!=='1'&&
+    confirm('Este celular tem peladas que não estão no placar ao vivo.\n\nOK: enviar os dados deste celular (substitui o que está lá).\nCancelar: ficar com os dados do placar ao vivo.'));
+  S=useOwn?own:remote;
+  cloud.key=key;ls.set('pelada.key',key);ls.set('pelada.synced','1');
+  cloud.sent=null;ui.sheet=null;save();render();toast('Pronto: você é o marcador');
+}
+function leaveScorer(){
+  if(!confirm('Sair do modo marcador neste celular?'))return;
+  clearTimeout(cloud.timer);cloud.timer=null;
+  cloud.key=null;ls.set('pelada.key',null);
+  if(cloud.last){S=parse(cloud.last);ls.set('pelada.cache',cloud.last)}
+  ui.sheet=null;
+}
 let S=load();
 const ui={tab:'jogo',sheet:null,scope:'hoje',view:null,pick:null,shared:null,focusAdd:false};
 
@@ -272,6 +365,8 @@ function vShared(){
     '<button class="btn" data-a="openApp">Abrir o app para marcar uma pelada</button>';
 }
 function vStart(){
+  if(isViewer())return'<h1>Pelada de Segunda</h1><div class="card"><p style="margin:0">Nenhuma pelada rolando agora. '+
+    'Quando o marcador começar, o placar aparece aqui ao vivo. Enquanto isso, veja o Ranking e o Histórico.</p></div>';
   return'<h1>Pelada de Segunda</h1><div class="card"><p style="margin-top:0">Marque os gols e quem está no gol durante o jogo. '+
     'No fim, o app monta a artilharia e o goleiro menos vazado para mandar no grupo.</p>'+
     '<button class="btn primary" data-a="newSession">Começar a pelada de hoje</button></div>';
@@ -283,11 +378,11 @@ function vLobby(c){
   let h='<h1>Pelada '+fmtDate(c.date)+'</h1>';
   h+='<div class="card"><h2>Quem veio ('+c.present.length+')</h2><div class="chips">'+
     roster.map(p=>'<button class="chip'+(c.present.includes(p.id)?' on':'')+'" data-a="present" data-id="'+p.id+'">'+esc(p.name)+'</button>').join('')+
-    '</div><div class="row" style="margin-top:12px"><input type="text" id="add" placeholder="Nome do jogador" maxlength="24" autocomplete="off">'+
+    '</div><div class="row ed" style="margin-top:12px"><input type="text" id="add" placeholder="Nome do jogador" maxlength="24" autocomplete="off">'+
     '<button class="btn small" style="flex:none" data-a="addPlayer">Adicionar</button></div></div>';
-  h+='<div class="card"><h2>Times</h2><div class="seg">'+[2,3,4].map(n=>
+  h+='<div class="card"><h2>Times</h2><div class="seg ed">'+[2,3,4].map(n=>
     '<button class="'+(c.teams.length===n?'on':'')+'" data-a="nTeams" data-v="'+n+'">'+n+' times</button>').join('')+'</div>'+
-    '<div class="row"><button class="btn" style="margin-top:0" data-a="shuffle">Sortear</button>'+
+    '<div class="row ed"><button class="btn" style="margin-top:0" data-a="shuffle">Sortear</button>'+
     '<button class="btn" style="margin-top:0" data-a="shuffleBal">Sortear equilibrado</button></div>';
   c.teams.forEach((t,i)=>{
     h+='<div class="teamhead" style="--tc:'+COLORS[i][1]+'"><span class="dot"></span>'+COLORS[i][0]+' ('+t.length+')</div><div class="chips">'+
@@ -296,9 +391,9 @@ function vLobby(c){
   });
   if(un.length)h+='<div class="teamhead" style="--tc:var(--muted)"><span class="dot"></span>Sem time ('+un.length+')</div><div class="chips">'+
     un.map(id=>'<button class="chip" data-a="cycle" data-id="'+id+'">'+esc(pname(id))+'</button>').join('')+'</div>';
-  h+='<p class="muted" style="margin-bottom:0">Toque num nome para trocar de time. O sorteio equilibrado usa as notas dos jogadores (em Histórico).</p></div>';
+  h+='<p class="muted ed" style="margin-bottom:0">Toque num nome para trocar de time. O sorteio equilibrado usa as notas dos jogadores (em Histórico).</p></div>';
 
-  h+='<div class="card"><h2>Próxima partida</h2>';
+  h+='<div class="card ed"><h2>Próxima partida</h2>';
   if(c.teams.length>2){
     const pk=ui.pick;
     [0,1].forEach(side=>{h+='<div class="chips" style="margin-bottom:10px">'+c.teams.map((t,i)=>
@@ -311,7 +406,7 @@ function vLobby(c){
     '<button class="btn primary" data-a="startMatch">Iniciar partida</button></div>';
 
   if(c.matches.length)h+=card('Partidas de hoje',matchesHTML(summary(c).m));
-  h+='<button class="btn danger" data-a="endSession">Encerrar a pelada</button>';
+  h+='<button class="btn danger ed" data-a="endSession">Encerrar a pelada</button>';
   return h;
 }
 function vLive(c,m){
@@ -324,7 +419,7 @@ function vLive(c,m){
     '<div class="clock" id="clock">'+fmtClock(mNow(m))+'</div>'+
     (lim?'<div class="muted limits">Acaba com '+lim+'</div>':'')+
     (over?'<div class="over">'+esc(over)+'</div>':'')+
-    '<button class="btn" data-a="timer">'+(m.runningSince?'Pausar cronômetro':'Retomar cronômetro')+'</button></div>';
+    '<button class="btn ed" data-a="timer">'+(m.runningSince?'Pausar cronômetro':'Retomar cronômetro')+'</button></div>';
   h+='<div class="cols">';
   [m.a,m.b].forEach((ti,side)=>{
     const gk=curGk(m,side);
@@ -336,14 +431,14 @@ function vLive(c,m){
     });
     h+='</div>';
   });
-  h+='</div><p class="muted">Toque no jogador para marcar gol ou colocar no gol.</p>';
+  h+='</div><p class="muted ed">Toque no jogador para marcar gol ou colocar no gol.</p>';
   if(m.goals.length){
     h+='<div class="card"><h2>Gols</h2><ul class="log">'+m.goals.slice().reverse().map(g=>
       '<li><span class="t">'+fmtClock(g.t)+'</span><span>⚽ '+esc(pname(g.p))+(g.own?' (contra)':'')+
       '<span class="muted">'+(g.a?' · passe: '+esc(pname(g.a)):'')+(g.gk?' · no gol: '+esc(pname(g.gk)):'')+'</span></span></li>').join('')+
-      '</ul><button class="btn small" style="margin-top:8px" data-a="undo">Desfazer último gol</button></div>';
+      '</ul><button class="btn small ed" style="margin-top:8px" data-a="undo">Desfazer último gol</button></div>';
   }
-  h+='<button class="btn primary" data-a="endMatch">Encerrar partida</button>';
+  h+='<button class="btn primary ed" data-a="endMatch">Encerrar partida</button>';
   return h;
 }
 function vSheet(c,m){
@@ -379,11 +474,20 @@ function vRank(){
   if(st.owns.length)h+=card('Bola murcha (gols contra)',listHTML(st.owns.map(p=>[p.name,p.own]),''));
   return h;
 }
+function vCloud(){
+  if(!cloud.on&&!cloud.exists&&!cloud.key)return'';
+  let t,b='';
+  if(!cloud.on)t='Sem conexão com o placar ao vivo agora.';
+  else if(cloud.key){t='Você é o marcador: o que você marca aparece na hora para quem abrir o link.';b='<button class="btn" data-a="leaveScorer">Sair do modo marcador</button>'}
+  else if(cloud.exists){t='Você está acompanhando ao vivo. Só o marcador altera o placar.';b='<button class="btn" data-a="scorer">Sou o marcador</button>'}
+  else{t='Ative para a turma acompanhar o placar e o ranking pelo link, na hora.';b='<button class="btn primary" data-a="scorer">Ativar placar ao vivo</button>'}
+  return'<div class="card"><h2>Placar ao vivo</h2><p class="muted" style="margin:0">'+t+'</p>'+b+'</div>';
+}
 function vHist(){
   if(ui.view){
     const s=S.sessions.find(x=>x.id===ui.view);
     if(s)return'<button class="btn small" data-a="back">← Voltar</button><h1 style="margin-top:12px">Pelada '+fmtDate(s.date)+'</h1>'+
-      summaryHTML(summary(s))+shareBtns+'<button class="btn danger" data-a="delSession">Apagar esta pelada</button>';
+      summaryHTML(summary(s))+shareBtns+'<button class="btn danger ed" data-a="delSession">Apagar esta pelada</button>';
     ui.view=null;
   }
   let h='<h1>Histórico</h1><div class="card"><h2>Peladas</h2>';
@@ -392,7 +496,7 @@ function vHist(){
     return'<button class="item" data-a="view" data-id="'+s.id+'"><span><b>'+fmtDate(s.date)+'</b><br><span class="muted">'+
       plural(s.matches.length,'partida','partidas')+(top?' · artilheiro: '+esc(top.name)+' ('+top.goals+')':'')+'</span></span><span class="muted">›</span></button>'}).join('')
     :'<p class="muted" style="margin:0">Nenhuma pelada encerrada ainda.</p>';
-  h+='</div><div class="card"><h2>Jogadores</h2>';
+  h+='</div>'+vCloud()+'<div class="card ed"><h2>Jogadores</h2>';
   const ps=S.players.filter(p=>!p.archived);
   h+=ps.length?'<p class="muted" style="margin-top:0">A nota (1 a 5) serve só para o sorteio equilibrado.</p>'+
     ps.map(p=>'<div class="item"><span style="font-weight:600">'+esc(p.name)+'</span><span style="display:flex;gap:6px;align-items:center">'+
@@ -400,8 +504,9 @@ function vHist(){
     '<button class="btn small" data-a="rename" data-id="'+p.id+'">Renomear</button>'+
     '<button class="btn small danger" data-a="archive" data-id="'+p.id+'">Tirar</button></span></div>').join('')
     :'<p class="muted" style="margin:0">Os jogadores aparecem aqui depois que você adicionar na pelada.</p>';
-  h+='</div><div class="card"><h2>Backup</h2><p class="muted" style="margin-top:0">Os dados ficam só neste celular. Salve um arquivo de vez em quando.</p>'+
-    '<button class="btn" data-a="export">Salvar backup</button><button class="btn" data-a="import">Restaurar backup</button>'+
+  h+='</div><div class="card"><h2>Backup</h2><p class="muted" style="margin-top:0">'+
+    (cloud.key||isViewer()?'Guarde uma cópia dos dados em arquivo, por segurança.':'Os dados ficam só neste celular. Salve um arquivo de vez em quando.')+'</p>'+
+    '<button class="btn" data-a="export">Salvar backup</button><button class="btn ed" data-a="import">Restaurar backup</button>'+
     '<input type="file" id="file" accept="application/json,.json" hidden></div>';
   return h;
 }
@@ -410,12 +515,13 @@ function render(){
   const app=$('#app'),nav=$('#nav');
   if(ui.shared){app.innerHTML=vShared();nav.style.display='none';return}
   nav.style.display='';
+  document.body.classList.toggle('ro',isViewer());
   const c=S.current,m=liveMatch();
   let h;
   if(ui.tab==='rank')h=vRank();
   else if(ui.tab==='hist')h=vHist();
   else if(!c)h=vStart();
-  else if(m)h=vLive(c,m)+(ui.sheet?vSheet(c,m):'');
+  else if(m)h=(isViewer()?'<div class="live">📡 Ao vivo</div>':'')+vLive(c,m)+(ui.sheet?vSheet(c,m):'');
   else{if(!ui.pick||ui.pick.a>=c.teams.length||ui.pick.b>=c.teams.length||ui.pick.a===ui.pick.b)ui.pick={a:0,b:1};h=vLobby(c)}
   app.innerHTML=h;
   nav.innerHTML=[['jogo','⚽','Jogo'],['rank','🏆','Ranking'],['hist','📋','Histórico']].map(t=>
@@ -591,8 +697,11 @@ const A={
     a.href=URL.createObjectURL(new Blob([JSON.stringify(S)],{type:'application/json'}));
     a.download='pelada-backup-'+today()+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
   },
-  import(){$('#file').click()}
+  import(){$('#file').click()},
+  scorer(){becomeScorer()},
+  leaveScorer(){leaveScorer()}
 };
+const VIEWER_OK=new Set(['tab','scope','view','back','share','image','copy','openApp','export','scorer']);
 /* campos que mudam por seleção (regras da partida e nota do jogador) */
 const C={
   rmin(el){S.prefs.rules.min=+el.value},
@@ -602,13 +711,14 @@ const C={
 };
 document.addEventListener('click',e=>{
   const el=e.target.closest('[data-a]');if(!el)return;
-  const f=A[el.dataset.a];if(!f)return;
+  const f=A[el.dataset.a];if(!f||(isViewer()&&!VIEWER_OK.has(el.dataset.a)))return;
   f(el.dataset,el,e);save();render();
 });
 document.addEventListener('keydown',e=>{
   if(e.key==='Enter'&&e.target.id==='add'){A.addPlayer();save();render()}
 });
 document.addEventListener('change',e=>{
+  if(isViewer())return;
   const c=e.target.dataset&&C[e.target.dataset.c];
   if(c){c(e.target);save();return}
   if(e.target.id!=='file'||!e.target.files[0])return;
@@ -621,19 +731,41 @@ document.addEventListener('change',e=>{
 });
 setInterval(()=>{
   const m=liveMatch();if(!m)return;
-  if(m.min&&!m.timeUp&&mNow(m)>=m.min*60000){ // tempo esgotado: para o relógio e avisa
+  if(!isViewer()&&m.min&&!m.timeUp&&mNow(m)>=m.min*60000){ // tempo esgotado: para o relógio e avisa
     m.timeUp=true;m.elapsed=m.min*60000;m.runningSince=null;
     alarm();save();render();toast('Tempo esgotado');return;
   }
   const el=$('#clock');if(el)el.textContent=fmtClock(mNow(m));
 },500);
 
+const NEW_HOME='https://pelada-de-segunda-30641.web.app/';
+function moveHome(){ // o app mudou de endereço: o antigo redireciona e leva junto os dados guardados nele
+  if(!location.hostname.endsWith('github.io'))return false;
+  let hash=location.hash;
+  if(!hash.startsWith('#r=')){
+    const own=ls.get(KEY),d=parse(own);
+    if(own&&own.length<60000&&(d.sessions.length||d.players.length||d.current))hash='#m='+enc(d);
+  }
+  location.replace(NEW_HOME+hash);return true;
+}
 function readHash(){
-  if(location.hash.startsWith('#r=')){try{ui.shared=cleanShared(dec(location.hash.slice(3)))}catch(e){ui.shared=null}}
+  const h=location.hash;
+  if(h.startsWith('#r=')){try{ui.shared=cleanShared(dec(h.slice(3)))}catch(e){ui.shared=null}}
+  if(h.startsWith('#m=')){ // dados trazidos do endereço antigo: só entram se este aparelho ainda não tem nada aqui
+    try{
+      const own=parse(ls.get(KEY)),d=normalize(dec(h.slice(3)));
+      if(!(own.sessions.length||own.players.length||own.current)&&Array.isArray(d.players)&&Array.isArray(d.sessions)){
+        ls.set(KEY,JSON.stringify(d));if(!isViewer())S=d;
+      }
+    }catch(e){}
+    history.replaceState(null,'',location.pathname);
+  }
 }
 window.addEventListener('hashchange',()=>{readHash();render()});
-readHash();render();
-if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+if(!moveHome()){
+  readHash();render();cloudInit();
+  if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+}
 </script>
 </body>
 </html>

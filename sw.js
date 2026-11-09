@@ -1,6 +1,6 @@
 // Guarda o app no aparelho para abrir sem internet.
 // Com internet, busca sempre a versão nova; sem sinal (ou sinal lento), usa a guardada.
-const CACHE = 'pelada-v2';
+const CACHE = 'pelada-v4';
 const SHELL = ['./', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -13,7 +13,13 @@ self.addEventListener('activate', e => {
 });
 self.addEventListener('fetch', e => {
   const req = e.request;
-  if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
+  if (req.method !== 'GET') return;
+  if (req.url.startsWith('https://www.gstatic.com/firebasejs/')) { // versão fixa: pode vir sempre do aparelho
+    e.respondWith(caches.open(CACHE).then(async c =>
+      (await c.match(req)) || fetch(req).then(res => { if (res.ok) c.put(req, res.clone()); return res; })));
+    return;
+  }
+  if (new URL(req.url).origin !== location.origin) return;
   e.respondWith((async () => {
     const cache = await caches.open(CACHE);
     const cached = await cache.match(req, { ignoreSearch: true }) || (req.mode === 'navigate' ? await cache.match('./') : undefined);
