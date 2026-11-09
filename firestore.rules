@@ -1,36 +1,72 @@
 rules_version = '2';
-// Todo mundo lê o placar. Só escreve quem manda, no mesmo envio, a senha do marcador.
-// A senha fica em documentos que ninguém consegue ler.
+// Todo mundo lê o placar. Dois papéis com senha podem gravar:
+//  - marcador: grava o placar;
+//  - admin: grava o placar, as notas dos jogadores (cifradas no próprio app) e troca as senhas.
+// Quem grava manda, no mesmo envio, a senha em /chaves/{papel}; ela é comparada com /segredos/{papel},
+// que ninguém consegue ler. As comparações usam get() (estado antes do envio), então um envio
+// não consegue trocar a senha e se autorizar ao mesmo tempo.
 service cloud.firestore {
   match /databases/{db}/documents {
-    // O envio precisa gravar a senha certa em /chaves/pelada junto com a alteração.
-    function chaveOk() {
-      let chave = getAfter(/databases/$(db)/documents/chaves/pelada).data;
-      return chave.at == request.time
-        && chave.senha == get(/databases/$(db)/documents/segredos/pelada).data.senha;
+    function chaveCom(papel) {
+      let c = /databases/$(db)/documents/chaves/$(papel);
+      let s = /databases/$(db)/documents/segredos/$(papel);
+      return existsAfter(c) && exists(s)
+        && getAfter(c).data.at == request.time
+        && getAfter(c).data.senha == get(s).data.senha;
     }
+    function marcador() { return chaveCom('pelada'); }
+    function admin() { return chaveCom('admin'); }
+    function senhaValida(min) {
+      return request.resource.data.keys().hasOnly(['senha'])
+        && request.resource.data.senha is string
+        && request.resource.data.senha.size() >= min
+        && request.resource.data.senha.size() <= 64;
+    }
+
     match /grupos/pelada {
       allow read: if true;
       allow create, update: if request.resource.data.keys().hasOnly(['data', 'at', 'by'])
         && request.resource.data.data is string
         && request.resource.data.data.size() < 900000
-        && chaveOk();
+        && (marcador() || admin());
+    }
+    // Notas dos jogadores, cifradas com a senha do admin: qualquer um baixa, só o admin entende e grava.
+    match /notas/pelada {
+      allow read: if true;
+      allow create, update: if request.resource.data.keys().hasOnly(['data', 'at'])
+        && request.resource.data.data is string
+        && request.resource.data.data.size() < 200000
+        && request.resource.data.at == request.time
+        && admin();
     }
     match /testes/pelada {
-      allow create, update: if chaveOk();
+      allow create, update: if marcador() || admin();
     }
-    match /chaves/pelada {
-      allow create, update: if request.resource.data.keys().hasOnly(['senha', 'at'])
+    match /chaves/{papel} {
+      allow create, update: if papel in ['pelada', 'admin']
+        && request.resource.data.keys().hasOnly(['senha', 'at'])
         && request.resource.data.senha is string
         && request.resource.data.senha.size() <= 64
         && request.resource.data.at == request.time;
     }
-    // A senha é definida uma única vez, por quem ativa o placar ao vivo.
+    // Senha do marcador: criada uma vez por quem ativa o placar ao vivo; depois, só o admin troca.
     match /segredos/pelada {
-      allow create: if request.resource.data.keys().hasOnly(['senha'])
-        && request.resource.data.senha is string
-        && request.resource.data.senha.size() >= 4
-        && request.resource.data.senha.size() <= 64;
+      allow create: if senhaValida(4);
+      allow update: if senhaValida(4) && admin();
+    }
+    // Senha do admin: criada uma vez por um marcador; depois, só o próprio admin troca.
+    match /segredos/admin {
+      allow create: if senhaValida(6) && marcador()
+        && existsAfter(/databases/$(db)/documents/publico/admin);
+      allow update: if senhaValida(6) && admin();
+    }
+    // Aviso público de que o admin já existe (sem a senha).
+    match /publico/admin {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasOnly(['criado'])
+        && request.resource.data.criado == request.time
+        && marcador()
+        && existsAfter(/databases/$(db)/documents/segredos/admin);
     }
   }
 }

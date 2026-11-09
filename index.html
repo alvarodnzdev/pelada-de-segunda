@@ -127,23 +127,37 @@ const plural=(n,a,b)=>n+' '+(n===1?a:b);
 const colorOf=name=>(COLORS.find(c=>c[0]===name)||[0,'#888'])[1];
 
 /* ---------- estado ---------- */
+const LEGACY={}; // notas que versões antigas guardavam junto dos jogadores: migram para as notas do admin
 function normalize(d){
   d=d||{};
   const rules=Object.assign({min:0,goals:0,assist:true},d.prefs&&d.prefs.rules);
-  return{players:d.players||[],sessions:d.sessions||[],current:d.current||null,prefs:{rules}};
+  const players=(d.players||[]).map(p=>{
+    if(!p||p.rating==null)return p;
+    LEGACY[p.id]=Math.min(5,Math.max(1,Number(p.rating)||3));
+    const{rating,...rest}=p;return rest;
+  });
+  return{players,sessions:d.sessions||[],current:d.current||null,prefs:{rules}};
 }
 const ls={get(k){try{return localStorage.getItem(k)}catch(e){return null}},
   set(k,v){try{v==null?localStorage.removeItem(k):localStorage.setItem(k,v)}catch(e){}}};
 const parse=t=>{try{return normalize(JSON.parse(t))}catch(e){return normalize()}};
 
 /* ---------- placar ao vivo (Firebase) ----------
-   Quem tem a senha do marcador (cloud.key) grava; os outros só acompanham.
+   Dois papéis com senha: o marcador grava o placar; o admin também grava e é o único que vê e muda
+   as notas dos jogadores, guardadas no banco cifradas com a senha dele. Quem não tem senha só acompanha.
    Fora do Firebase Hosting não há configuração, e o app funciona só neste aparelho. */
 const CONFIG_URL='/__/firebase/init.json'; // o Firebase Hosting entrega a configuração do projeto neste endereço
 const FB='https://www.gstatic.com/firebasejs/12.0.0/';
+const DB_ID='(default)';
 const DEVICE=ls.get('pelada.device')||(()=>{const d=uid()+uid();ls.set('pelada.device',d);return d})();
-const cloud={on:false,exists:ls.get('pelada.cloud')==='1',key:ls.get('pelada.key'),last:null,timer:null,sent:null,fs:null,db:null};
+const cloud={on:false,exists:ls.get('pelada.cloud')==='1',key:ls.get('pelada.key'),
+  role:ls.get('pelada.key')?(ls.get('pelada.role')||'marcador'):null,adminExists:ls.get('pelada.admin')==='1',
+  last:null,timer:null,sent:null,fs:null,db:null,retried:false,
+  nk:null,notasLoaded:false,notasTimer:null,unNotas:null};
 const isViewer=()=>cloud.exists&&!cloud.key;
+const isAdmin=()=>cloud.role==='admin'&&!!cloud.key;
+const localMode=()=>!cloud.exists&&!cloud.key;
+const canRate=()=>localMode()||(isAdmin()&&cloud.notasLoaded);
 
 function load(){return parse(ls.get(isViewer()?'pelada.cache':KEY))}
 function save(){
@@ -151,33 +165,110 @@ function save(){
   const j=JSON.stringify(S);
   if(j===cloud.sent)return;
   cloud.sent=j;ls.set(KEY,j);
-  if(cloud.on&&cloud.key){clearTimeout(cloud.timer);cloud.timer=setTimeout(()=>{cloud.timer=null;send(cloud.key).catch(sendFailed)},700)}
+  if(cloud.on&&cloud.key){clearTimeout(cloud.timer);cloud.timer=setTimeout(()=>{cloud.timer=null;send().catch(failWith(send))},700)}
 }
-function send(key){
+const keyDoc=b=>b.set(cloud.fs.doc(cloud.db,'chaves',isAdmin()?'admin':'pelada'),{senha:cloud.key,at:cloud.fs.serverTimestamp()});
+function send(){
   const{fs,db}=cloud,b=fs.writeBatch(db);
-  b.set(fs.doc(db,'chaves','pelada'),{senha:key,at:fs.serverTimestamp()});
+  keyDoc(b);
   b.set(fs.doc(db,'grupos','pelada'),{data:JSON.stringify(S),at:fs.serverTimestamp(),by:DEVICE});
   return b.commit();
 }
-function sendFailed(e){
-  if(!e||e.code!=='permission-denied'||!cloud.key)return;
-  if(!cloud.retried){cloud.retried=true;setTimeout(()=>{if(cloud.key)send(cloud.key).then(()=>{cloud.retried=false},sendFailed)},4000);return} // uma recusa isolada não derruba o marcador
-  cloud.retried=false;
-  cloud.key=null;ls.set('pelada.key',null);
-  if(cloud.last){S=parse(cloud.last);ui.sheet=null}
-  render();toast('A senha do marcador não vale mais neste celular');
+function failWith(again){ // uma recusa isolada não derruba ninguém; duas seguidas, a senha mudou
+  return e=>{
+    if(!e||e.code!=='permission-denied'||!cloud.key)return;
+    if(!cloud.retried){cloud.retried=true;setTimeout(()=>{if(cloud.key)again().then(()=>{cloud.retried=false},failWith(again))},4000);return}
+    cloud.retried=false;
+    dropRole();render();toast('Sua senha não vale mais neste celular. Entre de novo em Histórico.');
+  };
+}
+function dropRole(){
+  clearTimeout(cloud.timer);cloud.timer=null;stopNotas();
+  cloud.key=null;cloud.role=null;ls.set('pelada.key',null);ls.set('pelada.role',null);
+  if(cloud.last){S=parse(cloud.last);ls.set('pelada.cache',cloud.last)}
+  ui.sheet=null;
 }
 function onRemote(snap){
   cloud.exists=snap.exists();ls.set('pelada.cloud',cloud.exists?'1':null);
   if(cloud.exists&&!snap.metadata.hasPendingWrites){
     const d=snap.data();cloud.last=d.data;
     if(!cloud.key){S=parse(d.data);ls.set('pelada.cache',d.data);ui.sheet=null}
-    else if(d.by!==DEVICE&&!cloud.timer){S=parse(d.data);cloud.sent=d.data;ls.set(KEY,d.data);ui.sheet=null} // outro marcador gravou
+    else if(d.by!==DEVICE&&!cloud.timer){S=parse(d.data);cloud.sent=d.data;ls.set(KEY,d.data);ui.sheet=null} // outro aparelho gravou
   }
+  absorbLegacy(); // notas que um app antigo tenha mandado junto dos jogadores
   render();
 }
+
+/* ---------- notas dos jogadores (1 a 5) ----------
+   Sem placar ao vivo, ficam neste aparelho. Com placar ao vivo, só o admin vê: vão para o banco
+   cifradas (AES-GCM) com uma chave tirada da senha do admin, e quem baixa sem a senha não entende nada. */
+let RT=(()=>{try{return JSON.parse(ls.get('pelada.notas'))||{}}catch(e){return{}}})();
+const T8=new TextEncoder();
+const b64=u=>{let x='';u.forEach(c=>x+=String.fromCharCode(c));return btoa(x)};
+const unb64=t=>Uint8Array.from(atob(t),c=>c.charCodeAt(0));
+async function notasKey(pw){
+  const base=await crypto.subtle.importKey('raw',T8.encode(pw),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt:T8.encode('pelada-notas-v1'),iterations:150000,hash:'SHA-256'},
+    base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function seal(obj,k){
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},k,T8.encode(JSON.stringify(obj))));
+  const out=new Uint8Array(12+ct.length);out.set(iv);out.set(ct,12);return b64(out);
+}
+async function unseal(t,k){
+  const u=unb64(t);
+  return JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:u.slice(0,12)},k,u.slice(12))));
+}
+function absorbLegacy(){
+  if(!canRate())return;
+  let changed=false;
+  for(const id in LEGACY){if(!(id in RT)){RT[id]=LEGACY[id];changed=true}delete LEGACY[id]}
+  if(changed)notasChanged();
+}
+function notasChanged(){
+  if(localMode()){ls.set('pelada.notas',JSON.stringify(RT));return}
+  if(!isAdmin()||!cloud.on||!cloud.notasLoaded)return;
+  clearTimeout(cloud.notasTimer);
+  cloud.notasTimer=setTimeout(()=>{cloud.notasTimer=null;sendNotas().catch(failWith(sendNotas))},700);
+}
+async function sendNotas(){
+  const{fs,db}=cloud,data=await seal(RT,cloud.nk),b=fs.writeBatch(db);
+  keyDoc(b);
+  b.set(fs.doc(db,'notas','pelada'),{data,at:fs.serverTimestamp()});
+  return b.commit();
+}
+async function onNotas(snap){
+  if(!isAdmin()||!cloud.nk||snap.metadata.hasPendingWrites||cloud.notasTimer)return;
+  if(!snap.exists()){
+    if(snap.metadata.fromCache)return; // ainda não dá para saber se existem
+    cloud.notasLoaded=true;
+  }else{
+    try{RT=await unseal(snap.data().data,cloud.nk);cloud.notasLoaded=true}catch(e){return} // cifradas com outra senha
+  }
+  absorbLegacy();render();
+}
+function listenNotas(){
+  if(cloud.unNotas||!isAdmin()||!cloud.on)return;
+  const{fs,db}=cloud;
+  cloud.unNotas=fs.onSnapshot(fs.doc(db,'notas','pelada'),{includeMetadataChanges:true},onNotas,
+    ()=>{cloud.unNotas=null;setTimeout(listenNotas,5000)});
+}
+function stopNotas(){
+  if(cloud.unNotas){cloud.unNotas();cloud.unNotas=null}
+  clearTimeout(cloud.notasTimer);cloud.notasTimer=null;
+  cloud.nk=null;cloud.notasLoaded=false;RT={};
+}
+
 // se a escuta cair (erro de permissão ou de rede), tenta de novo em alguns segundos
 function listen(){const{fs,db}=cloud;fs.onSnapshot(fs.doc(db,'grupos','pelada'),onRemote,()=>setTimeout(listen,5000))}
+function listenAdmin(){
+  const{fs,db}=cloud;
+  fs.onSnapshot(fs.doc(db,'publico','admin'),snap=>{
+    if(snap.metadata.fromCache&&!snap.exists())return;
+    cloud.adminExists=snap.exists();ls.set('pelada.admin',cloud.adminExists?'1':null);render();
+  },()=>setTimeout(listenAdmin,5000));
+}
 async function cloudInit(){
   try{
     const res=await fetch(CONFIG_URL);
@@ -186,50 +277,107 @@ async function cloudInit(){
     const[app,fs]=await Promise.all([import(FB+'firebase-app.js'),import(FB+'firebase-firestore.js')]);
     const a=app.initializeApp(cfg);
     let db;
-    try{db=fs.initializeFirestore(a,{localCache:fs.persistentLocalCache({tabManager:fs.persistentMultipleTabManager()})})}
-    catch(e){db=fs.getFirestore(a)}
+    try{db=fs.initializeFirestore(a,{localCache:fs.persistentLocalCache({tabManager:fs.persistentMultipleTabManager()})},DB_ID)}
+    catch(e){db=fs.getFirestore(a,DB_ID)}
     cloud.fs=fs;cloud.db=db;cloud.on=true;
-    listen();
+    listen();listenAdmin();
+    if(isAdmin()){cloud.nk=await notasKey(cloud.key);listenNotas()}
     render();
   }catch(e){}
 }
 const within=(p,ms)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej({code:'timeout'}),ms))]);
-async function becomeScorer(){
-  if(!cloud.on||!navigator.onLine){toast('Sem conexão. Tente de novo com internet.');return}
-  const first=!cloud.exists;
-  const key=(prompt(first?'Crie a senha do marcador (mínimo 4 caracteres). Só quem tiver a senha consegue marcar gols.':'Senha do marcador')||'').trim();
+const offline=()=>{if(cloud.on&&navigator.onLine)return false;toast('Sem conexão. Tente de novo com internet.');return true};
+async function tryKey(papel,key){ // true: senha certa; false: errada; lança erro se não deu para conferir
+  const{fs,db}=cloud,b=fs.writeBatch(db);
+  b.set(fs.doc(db,'chaves',papel),{senha:key,at:fs.serverTimestamp()});
+  b.set(fs.doc(db,'testes','pelada'),{at:fs.serverTimestamp()});
+  try{await within(b.commit(),8000);return true}
+  catch(e){if(e&&e.code==='permission-denied')return false;throw e}
+}
+function askNew(msg,min){
+  const a=(prompt(msg)||'').trim();if(!a)return null;
+  if(a.length<min||a.length>64){toast('A senha precisa ter de '+min+' a 64 caracteres');return null}
+  const b=(prompt('Digite a mesma senha de novo, para conferir')||'').trim();
+  if(a!==b){toast('As duas senhas não são iguais. Tente de novo.');return null}
+  return a;
+}
+async function signIn(){
+  if(offline())return;
+  const first=!cloud.exists,{fs,db}=cloud;
+  const key=first?askNew('Crie a senha do marcador (mínimo 4 caracteres). Só quem tiver a senha consegue marcar gols.',4)
+    :(prompt('Sua senha (de marcador ou de admin)')||'').trim();
   if(!key)return;
-  if(key.length<4||key.length>64){toast('A senha precisa ter de 4 a 64 caracteres');return}
-  const{fs,db}=cloud;
-  try{await within(fs.setDoc(fs.doc(db,'segredos','pelada'),{senha:key}),8000)}catch(e){} // só grava se ainda não existe senha
+  if(first){try{await within(fs.setDoc(fs.doc(db,'segredos','pelada'),{senha:key}),8000)}catch(e){}} // só grava se ainda não existe
+  let role=null;
   try{
-    const b=fs.writeBatch(db);
-    b.set(fs.doc(db,'chaves','pelada'),{senha:key,at:fs.serverTimestamp()});
-    b.set(fs.doc(db,'testes','pelada'),{at:fs.serverTimestamp()});
-    await within(b.commit(),8000);
-  }catch(e){toast(e&&e.code==='permission-denied'?'Senha incorreta':'Não deu para conferir a senha. Tente de novo.');return}
+    if(await tryKey('pelada',key))role='marcador';
+    else if(!first&&await tryKey('admin',key))role='admin';
+  }catch(e){toast('Não deu para conferir a senha. Tente de novo.');return}
+  if(!role){toast('Senha incorreta');return}
   // decide entre os dados deste celular e os que já estão na nuvem
   const own=parse(ls.get(KEY)),remote=cloud.last?parse(cloud.last):null;
   const has=d=>!!d&&(d.sessions.length||d.players.length||d.current);
   const useOwn=!has(remote)||(has(own)&&ls.get('pelada.synced')!=='1'&&
     confirm('Este celular tem peladas que não estão no placar ao vivo.\n\nOK: enviar os dados deste celular (substitui o que está lá).\nCancelar: ficar com os dados do placar ao vivo.'));
   S=useOwn?own:remote;
-  cloud.key=key;ls.set('pelada.key',key);ls.set('pelada.synced','1');
-  cloud.sent=null;ui.sheet=null;save();render();toast('Pronto: você é o marcador');
+  cloud.key=key;cloud.role=role;ls.set('pelada.key',key);ls.set('pelada.role',role);ls.set('pelada.synced','1');
+  cloud.sent=null;ui.sheet=null;
+  if(role==='admin'){RT={};cloud.nk=await notasKey(key);listenNotas()}
+  save();render();toast(role==='admin'?'Pronto: você é o admin':'Pronto: você é o marcador');
 }
-function leaveScorer(){
-  if(!confirm('Sair do modo marcador neste celular?'))return;
-  clearTimeout(cloud.timer);cloud.timer=null;
-  cloud.key=null;ls.set('pelada.key',null);
-  if(cloud.last){S=parse(cloud.last);ls.set('pelada.cache',cloud.last)}
-  ui.sheet=null;
+async function createAdmin(){
+  if(offline()||!cloud.key||isAdmin())return;
+  const pw=askNew('Crie a senha do admin (mínimo 6 caracteres).\n\nCom ela dá para dar notas aos jogadores, sortear times equilibrados e marcar gols. As notas só aparecem para quem entrar com essa senha.',6);
+  if(!pw)return;
+  if(pw===cloud.key){toast('A senha do admin precisa ser diferente da do marcador');return}
+  const{fs,db}=cloud,b=fs.writeBatch(db);
+  keyDoc(b);
+  b.set(fs.doc(db,'segredos','admin'),{senha:pw});
+  b.set(fs.doc(db,'publico','admin'),{criado:fs.serverTimestamp()});
+  try{await within(b.commit(),8000)}
+  catch(e){toast(e&&e.code==='permission-denied'?'Não deu: o admin já foi criado, ou a senha do marcador mudou.':'Não deu para criar agora. Tente de novo.');return}
+  cloud.adminExists=true;ls.set('pelada.admin','1');
+  if(confirm('Senha do admin criada.\n\nOK: entrar como admin neste celular agora.\nCancelar: continuar como marcador (o admin entra pelo celular dele, em Histórico > Entrar com senha).')){
+    clearTimeout(cloud.timer);cloud.timer=null;
+    cloud.key=pw;cloud.role='admin';ls.set('pelada.key',pw);ls.set('pelada.role','admin');
+    RT={};cloud.nk=await notasKey(pw);listenNotas();cloud.sent=null;save();
+  }
+  render();toast('Senha do admin criada');
+}
+async function changeKey(papel){
+  if(offline()||!isAdmin())return;
+  const adm=papel==='admin';
+  if(adm&&!cloud.notasLoaded){toast('Espere as notas carregarem e tente de novo');return}
+  const pw=askNew(adm?'Nova senha do admin (mínimo 6 caracteres)':
+    'Nova senha do marcador (mínimo 4 caracteres).\n\nQuem estiver marcando com a senha antiga deixa de conseguir marcar.',adm?6:4);
+  if(!pw)return;
+  if(!adm&&pw===cloud.key){toast('A senha do marcador precisa ser diferente da do admin');return}
+  const{fs,db}=cloud,b=fs.writeBatch(db);
+  keyDoc(b);
+  let nk=null;
+  if(adm){ // troca a senha, recifra as notas e grava o placar pendente, tudo de uma vez
+    clearTimeout(cloud.notasTimer);cloud.notasTimer=null;clearTimeout(cloud.timer);cloud.timer=null;
+    nk=await notasKey(pw);
+    b.set(fs.doc(db,'segredos','admin'),{senha:pw});
+    b.set(fs.doc(db,'notas','pelada'),{data:await seal(RT,nk),at:fs.serverTimestamp()});
+    b.set(fs.doc(db,'grupos','pelada'),{data:JSON.stringify(S),at:fs.serverTimestamp(),by:DEVICE});
+  }else b.set(fs.doc(db,'segredos','pelada'),{senha:pw});
+  try{await within(b.commit(),8000)}catch(e){toast('Não deu para trocar a senha agora. Tente de novo.');return}
+  if(adm){cloud.key=pw;cloud.nk=nk;ls.set('pelada.key',pw)}
+  toast(adm?'Senha do admin trocada':'Senha do marcador trocada. Passe a nova para quem marca.');
+}
+function leave(){
+  if(!confirm('Sair do modo '+(isAdmin()?'admin':'marcador')+' neste celular?'))return;
+  dropRole();
 }
 let S=load();
 const ui={tab:'jogo',sheet:null,scope:'hoje',view:null,pick:null,shared:null,focusAdd:false};
 
 const player=id=>S.players.find(p=>p.id===id);
 const pname=id=>(player(id)||{name:'?'}).name;
-const rating=id=>(player(id)||{}).rating||3;
+const rating=id=>(id in RT)?RT[id]:3; // sem nota conta como 3
+const strength=t=>t.reduce((n,id)=>n+rating(id),0);
+const spreadOf=teams=>{const v=teams.map(strength);return Math.max(...v)-Math.min(...v)};
 const liveMatch=()=>{const c=S.current;if(!c)return null;const m=c.matches[c.matches.length-1];return m&&!m.done?m:null};
 const mNow=m=>m.elapsed+(m.runningSince?Date.now()-m.runningSince:0);
 const curGk=(m,side)=>{const st=m.gk[side],l=st[st.length-1];return l&&l.to==null?l.p:null};
@@ -374,7 +522,7 @@ function vStart(){
 function vLobby(c){
   const roster=S.players.filter(p=>!p.archived||c.present.includes(p.id));
   const un=c.present.filter(id=>!c.teams.some(t=>t.includes(id)));
-  const r=S.prefs.rules;
+  const r=S.prefs.rules,rate=canRate();
   let h='<h1>Pelada '+fmtDate(c.date)+'</h1>';
   h+='<div class="card"><h2>Quem veio ('+c.present.length+')</h2><div class="chips">'+
     roster.map(p=>'<button class="chip'+(c.present.includes(p.id)?' on':'')+'" data-a="present" data-id="'+p.id+'">'+esc(p.name)+'</button>').join('')+
@@ -382,16 +530,19 @@ function vLobby(c){
     '<button class="btn small" style="flex:none" data-a="addPlayer">Adicionar</button></div></div>';
   h+='<div class="card"><h2>Times</h2><div class="seg ed">'+[2,3,4].map(n=>
     '<button class="'+(c.teams.length===n?'on':'')+'" data-a="nTeams" data-v="'+n+'">'+n+' times</button>').join('')+'</div>'+
-    '<div class="row ed"><button class="btn" style="margin-top:0" data-a="shuffle">Sortear</button>'+
-    '<button class="btn" style="margin-top:0" data-a="shuffleBal">Sortear equilibrado</button></div>';
+    '<div class="row ed">'+(rate?'<button class="btn primary" style="margin-top:0" data-a="shuffleBal">Sortear equilibrado</button>':
+      '<button class="btn" style="margin-top:0" data-a="shuffle">Sortear</button>')+'</div>';
   c.teams.forEach((t,i)=>{
-    h+='<div class="teamhead" style="--tc:'+COLORS[i][1]+'"><span class="dot"></span>'+COLORS[i][0]+' ('+t.length+')</div><div class="chips">'+
-      (t.map(id=>'<button class="chip team" style="--tc:'+COLORS[i][1]+'" data-a="cycle" data-id="'+id+'">'+esc(pname(id))+'</button>').join('')||
+    h+='<div class="teamhead" style="--tc:'+COLORS[i][1]+'"><span class="dot"></span>'+COLORS[i][0]+' ('+t.length+')'+
+      (rate&&t.length?'<span class="muted" style="font-weight:600">· força '+strength(t)+'</span>':'')+'</div><div class="chips">'+
+      (t.map(id=>'<button class="chip team" style="--tc:'+COLORS[i][1]+'" data-a="cycle" data-id="'+id+'">'+esc(pname(id))+
+        (rate?' <span style="opacity:.6">'+rating(id)+'</span>':'')+'</button>').join('')||
        '<span class="muted">vazio</span>')+'</div>';
   });
   if(un.length)h+='<div class="teamhead" style="--tc:var(--muted)"><span class="dot"></span>Sem time ('+un.length+')</div><div class="chips">'+
     un.map(id=>'<button class="chip" data-a="cycle" data-id="'+id+'">'+esc(pname(id))+'</button>').join('')+'</div>';
-  h+='<p class="muted ed" style="margin-bottom:0">Toque num nome para trocar de time. O sorteio equilibrado usa as notas dos jogadores (em Histórico).</p></div>';
+  h+='<p class="muted ed" style="margin-bottom:0">Toque num nome para trocar de time.'+
+    (rate?' A força é a soma das notas (quem não tem nota conta 3)'+(localMode()?'':'; só o admin vê')+'. As notas ficam em Histórico.':'')+'</p></div>';
 
   h+='<div class="card ed"><h2>Próxima partida</h2>';
   if(c.teams.length>2){
@@ -478,8 +629,12 @@ function vCloud(){
   if(!cloud.on&&!cloud.exists&&!cloud.key)return'';
   let t,b='';
   if(!cloud.on)t='Sem conexão com o placar ao vivo agora.';
-  else if(cloud.key){t='Você é o marcador: o que você marca aparece na hora para quem abrir o link.';b='<button class="btn" data-a="leaveScorer">Sair do modo marcador</button>'}
-  else if(cloud.exists){t='Você está acompanhando ao vivo. Só o marcador altera o placar.';b='<button class="btn" data-a="scorer">Sou o marcador</button>'}
+  else if(isAdmin()){t='Você é o admin: dá notas aos jogadores (só você vê), sorteia times equilibrados e marca gols.';
+    b='<button class="btn" data-a="chgMarcador">Trocar senha do marcador</button><button class="btn" data-a="chgAdmin">Trocar senha do admin</button>'+
+      '<button class="btn" data-a="leave">Sair do modo admin</button>'}
+  else if(cloud.key){t='Você é o marcador: o que você marca aparece na hora para quem abrir o link.';
+    b=(cloud.adminExists?'':'<button class="btn" data-a="mkAdmin">Criar senha do admin</button>')+'<button class="btn" data-a="leave">Sair do modo marcador</button>'}
+  else if(cloud.exists){t='Você está acompanhando ao vivo. Só o marcador e o admin alteram o placar.';b='<button class="btn" data-a="scorer">Entrar com senha</button>'}
   else{t='Ative para a turma acompanhar o placar e o ranking pelo link, na hora.';b='<button class="btn primary" data-a="scorer">Ativar placar ao vivo</button>'}
   return'<div class="card"><h2>Placar ao vivo</h2><p class="muted" style="margin:0">'+t+'</p>'+b+'</div>';
 }
@@ -498,9 +653,13 @@ function vHist(){
     :'<p class="muted" style="margin:0">Nenhuma pelada encerrada ainda.</p>';
   h+='</div>'+vCloud()+'<div class="card ed"><h2>Jogadores</h2>';
   const ps=S.players.filter(p=>!p.archived);
-  h+=ps.length?'<p class="muted" style="margin-top:0">A nota (1 a 5) serve só para o sorteio equilibrado.</p>'+
+  const rate=canRate(),rateNote=rate?(localMode()?'A nota (1 a 5) serve para o sorteio equilibrado.':
+      'A nota (1 a 5) serve para o sorteio equilibrado e só aparece para o admin.'):
+    (isAdmin()?'Carregando as notas…':'');
+  h+=ps.length?(rateNote?'<p class="muted" style="margin-top:0">'+rateNote+'</p>':'')+
     ps.map(p=>'<div class="item"><span style="font-weight:600">'+esc(p.name)+'</span><span style="display:flex;gap:6px;align-items:center">'+
-    '<select class="mini" data-c="rating" data-id="'+p.id+'" aria-label="Nota de '+esc(p.name)+'">'+[1,2,3,4,5].map(v=>opt(v,p.rating||3,'Nota '+v)).join('')+'</select>'+
+    (rate?'<select class="mini" data-c="rating" data-id="'+p.id+'" aria-label="Nota de '+esc(p.name)+'">'+
+      opt('',(p.id in RT)?RT[p.id]:'','Sem nota')+[1,2,3,4,5].map(v=>opt(v,RT[p.id],'Nota '+v)).join('')+'</select>':'')+
     '<button class="btn small" data-a="rename" data-id="'+p.id+'">Renomear</button>'+
     '<button class="btn small danger" data-a="archive" data-id="'+p.id+'">Tirar</button></span></div>').join('')
     :'<p class="muted" style="margin:0">Os jogadores aparecem aqui depois que você adicionar na pelada.</p>';
@@ -573,12 +732,39 @@ function addGoal(own){
   if(m.maxGoals&&Math.max(r[0],r[1])>=m.maxGoals){pause(m);alarm()}
   toast((own?'Gol contra de ':'Gol de ')+pname(id),'undo');
 }
+const shuffled=a=>{a=a.slice();for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a};
+const dealt=(ids,n)=>{const t=Array.from({length:n},()=>[]);ids.forEach((id,i)=>t[i%n].push(id));return t};
+/* Sorteio equilibrado: os times ficam com o mesmo número de jogadores (ou um a mais) e com a soma das notas
+   o mais parecida possível; empatando, também espalha os craques (nota 4 ou 5). Faz várias tentativas
+   partindo de divisões aleatórias e troca jogadores entre times enquanto melhorar; entre as melhores
+   divisões, escolhe uma ao acaso, para os times não saírem sempre iguais. */
+function balance(ids,n){
+  const cost=teams=>{
+    const v=teams.map(strength),top=teams.map(t=>t.filter(id=>rating(id)>=4).length);
+    return(Math.max(...v)-Math.min(...v))*1e4+(Math.max(...top)-Math.min(...top))*100+v.reduce((a,x)=>a+x*x,0)/1e4;
+  };
+  const tries=ids.length>2*n?300:20;
+  let best=[],bestCost=Infinity;
+  for(let k=0;k<tries;k++){
+    const teams=dealt(shuffled(ids),n);
+    let cur=cost(teams),better=true;
+    while(better){
+      better=false;
+      for(let a=0;a<n;a++)for(let b=a+1;b<n;b++)for(let i=0;i<teams[a].length;i++)for(let j=0;j<teams[b].length;j++){
+        const x=teams[a][i],y=teams[b][j];
+        if(rating(x)===rating(y))continue;
+        teams[a][i]=y;teams[b][j]=x;
+        const c2=cost(teams);
+        if(c2<cur-1e-9){cur=c2;better=true}else{teams[a][i]=x;teams[b][j]=y}
+      }
+    }
+    if(cur<bestCost-1e-9){bestCost=cur;best=[teams]}else if(Math.abs(cur-bestCost)<1e-9)best.push(teams);
+  }
+  return best[Math.floor(Math.random()*best.length)];
+}
 function deal(balanced){
-  const c=S.current,n=c.teams.length,ids=c.present.slice();
-  for(let i=ids.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[ids[i],ids[j]]=[ids[j],ids[i]]}
-  if(balanced)ids.sort((a,b)=>rating(b)-rating(a)); // ordenação estável: empates continuam embaralhados
-  c.teams=c.teams.map(()=>[]);
-  ids.forEach((id,i)=>{const pos=i%n;c.teams[balanced&&Math.floor(i/n)%2?n-1-pos:pos].push(id)});
+  const c=S.current,n=c.teams.length;
+  c.teams=balanced?balance(c.present,n):dealt(shuffled(c.present),n);
 }
 function currentSummary(){
   if(ui.shared)return ui.shared;
@@ -597,7 +783,7 @@ const A={
     const inp=$('#add'),name=inp.value.trim().replace(/\s+/g,' ');
     ui.focusAdd=true;if(!name)return;
     let p=S.players.find(x=>x.name.toLowerCase()===name.toLowerCase());
-    if(p)p.archived=false;else{p={id:uid(),name,rating:3};S.players.push(p)}
+    if(p)p.archived=false;else{p={id:uid(),name};S.players.push(p)}
     if(!S.current.present.includes(p.id))S.current.present.push(p.id);
   },
   nTeams(d){
@@ -606,7 +792,12 @@ const A={
     c.teams.length=n;
   },
   shuffle(){deal(false)},
-  shuffleBal(){deal(true)},
+  shuffleBal(){
+    if(!canRate())return;
+    deal(true);
+    const c=S.current;
+    if(c.present.length>=c.teams.length)toast('Times sorteados. Diferença de força: '+spreadOf(c.teams));
+  },
   cycle(d){
     const c=S.current,i=c.teams.findIndex(t=>t.includes(d.id));
     if(i>=0)c.teams[i]=c.teams[i].filter(x=>x!==d.id);
@@ -694,12 +885,15 @@ const A={
   openApp(){ui.shared=null;history.replaceState(null,'',location.pathname)},
   export(){
     const a=document.createElement('a');
-    a.href=URL.createObjectURL(new Blob([JSON.stringify(S)],{type:'application/json'}));
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(canRate()?Object.assign({notas:RT},S):S)],{type:'application/json'}));
     a.download='pelada-backup-'+today()+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
   },
   import(){$('#file').click()},
-  scorer(){becomeScorer()},
-  leaveScorer(){leaveScorer()}
+  scorer(){signIn()},
+  mkAdmin(){createAdmin()},
+  chgMarcador(){changeKey('pelada')},
+  chgAdmin(){changeKey('admin')},
+  leave(){leave()}
 };
 const VIEWER_OK=new Set(['tab','scope','view','back','share','image','copy','openApp','export','scorer']);
 /* campos que mudam por seleção (regras da partida e nota do jogador) */
@@ -707,7 +901,12 @@ const C={
   rmin(el){S.prefs.rules.min=+el.value},
   rgoals(el){S.prefs.rules.goals=+el.value},
   rassist(el){S.prefs.rules.assist=el.checked},
-  rating(el){const p=player(el.dataset.id);if(p)p.rating=+el.value}
+  rating(el){
+    if(!canRate())return;
+    const id=el.dataset.id;
+    if(el.value==='')delete RT[id];else RT[id]=Math.min(5,Math.max(1,+el.value));
+    notasChanged();
+  }
 };
 document.addEventListener('click',e=>{
   const el=e.target.closest('[data-a]');if(!el)return;
@@ -726,7 +925,9 @@ document.addEventListener('change',e=>{
     const d=JSON.parse(t);
     if(!Array.isArray(d.players)||!Array.isArray(d.sessions))throw new Error();
     if(!confirm('Substituir os dados deste celular pelo backup?'))return;
-    S=normalize(d);save();render();toast('Backup restaurado');
+    S=normalize(d);
+    if(d.notas&&typeof d.notas==='object')for(const id in d.notas)LEGACY[id]=Math.min(5,Math.max(1,+d.notas[id]||3));
+    absorbLegacy();save();render();toast('Backup restaurado');
   }).catch(()=>toast('Arquivo de backup inválido'));
 });
 setInterval(()=>{
@@ -763,7 +964,7 @@ function readHash(){
 }
 window.addEventListener('hashchange',()=>{readHash();render()});
 if(!moveHome()){
-  readHash();render();cloudInit();
+  readHash();absorbLegacy();render();cloudInit();
   if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
 }
 </script>

@@ -1,6 +1,6 @@
 // Guarda o app no aparelho para abrir sem internet.
 // Com internet, busca sempre a versão nova; sem sinal (ou sinal lento), usa a guardada.
-const CACHE = 'pelada-v4';
+const CACHE = 'pelada-v5';
 const SHELL = ['./', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
